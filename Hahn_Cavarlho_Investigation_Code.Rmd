@@ -1,0 +1,799 @@
+---
+title: "STAT 525 Project"
+author: "Michael Price"
+date: "11/23/2020"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+
+library(LearnBayes)
+library(corrplot)
+library(clusterGeneration)
+library(glmnet)
+library(rstan)
+library(dplyr)
+library(car)
+library(coda)
+library(leaps)
+library(ggplot2)
+library(corrplot)
+library(glmnet)
+library(lars)
+```
+
+
+```{r}
+
+generate_gaussian_data_set <- function(n, p, actual, multicol, sigma_2, mean_vec = rep(0, p), 
+                                  beta_range = c(-2, 2), seed = 1){
+  
+  # Generate a random linear regression data, with multicollinearity specified by user
+  
+  # n - number of observations
+  # p - number of predictors
+  # actual - number of predictors where beta does not equal 0
+  # multicol - multicollinearity parameter, the lower it is, the higher the multicollinearity
+  # sigma_2 - sigma_2 parameter
+  # mean_vec - mean vector for X data
+  # beta_range - min and max of values for Betas
+  
+  
+  set.seed(seed)
+  # Generate random correlation matrix
+  corr_mat <- rcorrmatrix(p, multicol)
+  
+  # Simulate X matrix
+  sim_data <- rmnorm(n, mean = mean_vec, varcov = corr_mat)
+  
+  # Simulate Betas
+  rand_betas <- runif(actual, beta_range[1], beta_range[2])
+  rand_pos <- sample(1:p, actual)
+  betas_all <- rep(0, p)
+  betas_all[rand_pos] <- rand_betas
+  beta_matrix <- matrix(betas_all, ncol = 1)
+  
+  # Simulate y
+  y_data <- sim_data %*% beta_matrix + matrix(rnorm(n, 0, sigma_2), ncol = 1)
+  
+  # Put into dataframe
+  all_data <- data.frame(sim_data, y = y_data)
+  
+  # Return data and Betas
+  return_lst <- list()
+  
+  return_lst[["Simulated Data"]] <- all_data
+  return_lst[["Coefficients"]] <- beta_matrix
+  
+  return(return_lst)
+}
+
+```
+`
+
+```{r}
+
+# Generate 1st Dataset 
+data_1 <-  generate_gaussian_data_set(1200, 20, 5, 0.05, 3, mean_vec = rep(0, 20), 
+                                  beta_range = c(-3, 3), seed = 4)
+
+
+ss_data_1x <- as.matrix(dplyr::select(data_1$`Simulated Data`[1:1000, ], -c(y)))
+ss_data_1y <- as.matrix(dplyr::select(data_1$`Simulated Data`[1:1000, ], y))
+
+test_set_1x <- as.matrix(dplyr::select(data_1$`Simulated Data`[1001:1200, ], -c(y)))
+test_set_1y <- as.matrix(dplyr::select(data_1$`Simulated Data`[1001:1200, ], y))
+
+# Generate 2nd Dataset 
+data_2 <- generate_gaussian_data_set(300, 50, 5, 0.2, 5, mean_vec = rep(0, 50), 
+                                     beta_range = c(-3, 3), seed = 1)
+
+ss_data_2x <- as.matrix(dplyr::select(data_2$`Simulated Data`[1:100, ], -c(y)))
+ss_data_2y <- as.matrix(dplyr::select(data_2$`Simulated Data`[1:100, ], y))
+
+test_set_2x <- as.matrix(dplyr::select(data_2$`Simulated Data`[101:300, ], -c(y)))
+test_set_2y <- as.matrix(dplyr::select(data_2$`Simulated Data`[101:300, ], y))
+
+# Generate 3rd Dataset 
+
+data_3 <- generate_gaussian_data_set(300, 50, 25, 0.2, 2, mean_vec = rep(0, 50), 
+                                     beta_range = c(-3, 3), seed = 101)
+
+
+ss_data_3x <- as.matrix(dplyr::select(data_3$`Simulated Data`[1:100, ], -c(y)))
+ss_data_3y <- as.matrix(dplyr::select(data_3$`Simulated Data`[1:100, ], y))
+
+test_set_3x <- as.matrix(dplyr::select(data_3$`Simulated Data`[101:300, ], -c(y)))
+test_set_3y <- as.matrix(dplyr::select(data_3$`Simulated Data`[101:300, ], y))
+
+```
+
+```{r}
+corrplot(cor(data_1$`Simulated Data`))
+```
+
+
+```{r}
+get_estimates_stan <- function(hyper_list, stan_model_name, iterations, no_chains){
+  
+  # Given Stan object and data, will extract betas and sigma_2 from linear regression model
+  
+  sampling_object <- sampling(object = stan_model_name, 
+                              data = hyper_list, 
+                              iter = iterations, chains = no_chains)
+  
+  beta_matrix <- rstan::extract(sampling_object , 'beta', permuted =TRUE)[[1]]
+  sigma_2_vec <-  1/rstan::extract(sampling_object, 'precision', permuted =TRUE)[[1]]
+  
+  return(list(Beta_Matrix = beta_matrix,
+              Sigma_2 = sigma_2_vec))
+}
+```
+
+
+## Bayesian LASSO
+```{r}
+
+
+# Data 1 - Bayesian LASSO
+data_lasso_1a <-  list(N = dim(ss_data_1x)[1], 
+               K = dim(ss_data_1x)[2], 
+               X = ss_data_1x, 
+               y = as.vector(ss_data_1y), 
+               a_tau = 1,
+               b_tau = 1, 
+               a_lambda = 0.1, 
+               b_lambda = 0.1)
+
+# Data 2 - Bayesian LASSO
+data_lasso_2a <-  list(N = dim(ss_data_2x)[1], 
+               K = dim(ss_data_2x)[2], 
+               X = ss_data_2x, 
+               y = as.vector(ss_data_2y), 
+               a_tau = 1,
+               b_tau = 1, 
+               a_lambda = 0.1, 
+               b_lambda = 0.1)
+
+# Data 3 - Bayesian LASSO
+data_lasso_3a <-  list(N = dim(ss_data_3x)[1], 
+               K = dim(ss_data_3x)[2], 
+               X = ss_data_3x, 
+               y = as.vector(ss_data_3y), 
+               a_tau = 1,
+               b_tau = 1, 
+               a_lambda = 0.1, 
+               b_lambda = 0.1)
+
+bayes_lasso <- stan_model("stan_code/bayesian_lasso.stan")
+
+# Get estimates
+
+estimates_bl_1a <-  get_estimates_stan(data_lasso_1a, bayes_lasso, 20000, 1)
+estimates_bl_2a <-  get_estimates_stan(data_lasso_2a, bayes_lasso, 20000, 1)
+estimates_bl_3a <-  get_estimates_stan(data_lasso_3a, bayes_lasso, 20000, 1)
+
+
+```
+
+## Horseshoe Prior 
+```{r}
+
+# "variance" of half-cauchy
+A_1 <- rep(1, dim(ss_data_1x)[2])
+A_2 <- rep(1, dim(ss_data_2x)[2])
+
+# C Parameter for 2 datasets 
+c_1 <- rep(10, dim(ss_data_1x)[2])
+c_2 <- rep(10, dim(ss_data_2x)[2])
+
+horseshoe_prior <- stan_model("stan_code/horseshoe_prior.stan")
+
+# Data 1 - Horseshoe 
+data_horesehoe_1a <-  list(N = dim(ss_data_1x)[1], 
+               K = dim(ss_data_1x)[2], 
+               X = ss_data_1x, 
+               y = as.vector(ss_data_1y), 
+               A = A_1, 
+               a_tau = 1, 
+               b_tau = 1, 
+               c = c_1)
+
+# Data 2 - Horseshoe 
+data_horesehoe_2a <-  list(N = dim(ss_data_2x)[1], 
+               K = dim(ss_data_2x)[2], 
+               X = ss_data_2x, 
+               y = as.vector(ss_data_2y), 
+               A = A_2, 
+               a_tau = 1, 
+               b_tau = 1, 
+               c = c_2)
+
+# Data 3 - Horseshoe 
+data_horesehoe_3a <-  list(N = dim(ss_data_3x)[1], 
+               K = dim(ss_data_3x)[2], 
+               X = ss_data_3x, 
+               y = as.vector(ss_data_3y), 
+               A = A_2, 
+               a_tau = 1, 
+               b_tau = 1, 
+               c = c_2)
+
+
+# Get estimates 
+estimates_hs_1a <-  get_estimates_stan(data_horesehoe_1a, horseshoe_prior, 20000, 1)
+estimates_hs_2a <-  get_estimates_stan(data_horesehoe_2a, horseshoe_prior, 20000, 1)
+estimates_hs_3a <-  get_estimates_stan(data_horesehoe_3a, horseshoe_prior, 20000, 1)
+
+```
+
+
+## SSVS 
+
+```{r}
+
+ssvs_stan <- stan_model("stan_code/ssvs.stan")
+
+# Data 1 - SSVS
+
+data_ssvs_1a <- list(N = dim(ss_data_1x)[1], 
+               K = dim(ss_data_1x)[2], 
+               X = ss_data_1x, 
+               y = as.vector(ss_data_1y), 
+               a_tau = 1, 
+               b_tau = 1, 
+               sigma_prior = rep(0.01, dim(ss_data_1x)[2]), 
+               c_prior = rep(1000, dim(ss_data_1x)[2]), 
+               pi_prior = rep(1/2, dim(ss_data_1x)[2]))
+
+# Data 2 - SSVS
+
+data_ssvs_2a <- list(N = dim(ss_data_2x)[1], 
+               K = dim(ss_data_2x)[2], 
+               X = ss_data_2x, 
+               y = as.vector(ss_data_2y), 
+               a_tau = 1, 
+               b_tau = 1, 
+               sigma_prior = rep(0.01, dim(ss_data_2x)[2]), 
+               c_prior = rep(1000, dim(ss_data_2x)[2]), 
+               pi_prior = rep(1/2, dim(ss_data_2x)[2]))
+
+# Data 3 - SSVS
+
+data_ssvs_3a <- list(N = dim(ss_data_3x)[1], 
+               K = dim(ss_data_3x)[2], 
+               X = ss_data_3x, 
+               y = as.vector(ss_data_3y), 
+               a_tau = 1, 
+               b_tau = 1, 
+               sigma_prior = rep(0.01, dim(ss_data_3x)[2]), 
+               c_prior = rep(1000, dim(ss_data_3x)[2]), 
+               pi_prior = rep(1/2, dim(ss_data_3x)[2]))
+
+# Get estimates of SSVS for first dataset 
+estimates_ssvs_1a <-  get_estimates_stan(data_ssvs_1a , ssvs_stan, 20000, 1)
+
+# Get estimates for SSVS - 2nd dataset 
+estimates_ssvs_2a <-  get_estimates_stan(data_ssvs_2a , ssvs_stan, 20000, 1)
+
+# Get estimates for SSVS - 3rd dataset 
+estimates_ssvs_3a <-  get_estimates_stan(data_ssvs_3a , ssvs_stan, 20000, 1)
+
+
+
+```
+
+
+
+```{r}
+
+ish_rao_modified <- stan_model("stan_code/ish_rao_modified.stan")
+
+# Data 1 - Ishwaran-Rao
+data_ish_1a <-  list(N = dim(ss_data_1x)[1], 
+               K = dim(ss_data_1x)[2], 
+               X = ss_data_1x, 
+               y = as.vector(ss_data_1y), 
+               a_beta = 2, 
+               b_beta = 200, 
+               a_tau = 1, 
+               b_tau = 1, 
+               v_0 = 10^(-6))
+# Data 2 - Ishwaran-Rao
+data_ish_2a <-  list(N = dim(ss_data_2x)[1], 
+               K = dim(ss_data_2x)[2], 
+               X = ss_data_2x, 
+               y = as.vector(ss_data_2y), 
+               a_beta = 2, 
+               b_beta = 200, 
+               a_tau = 1, 
+               b_tau = 1, 
+               v_0 = 10^(-6))
+
+# Data 3 - Ishwaran-Rao
+data_ish_3a <-  list(N = dim(ss_data_3x)[1], 
+               K = dim(ss_data_3x)[2], 
+               X = ss_data_3x, 
+               y = as.vector(ss_data_3y), 
+               a_beta = 2, 
+               b_beta = 200, 
+               a_tau = 1, 
+               b_tau = 1, 
+               v_0 = 10^(-6))
+
+
+# Get estimates 
+estimates_ish_1a <-  get_estimates_stan(data_ish_1a, ish_rao_modified, 20000, 1)
+estimates_ish_2a <-  get_estimates_stan(data_ish_2a, ish_rao_modified, 20000, 1)
+estimates_ish_3a <-  get_estimates_stan(data_ish_3a, ish_rao_modified, 20000, 1)
+
+```
+
+
+```{r}
+rho_lambda_ve <- function(X_matrix, beta_matrix, sigma_vector){
+  
+  # Finds sequences of distributions for rho_lambda
+  
+  n <- dim(X_matrix)[1]
+  p <- dim(X_matrix)[2]
+  
+  # Get posterior mean
+  post_mean <- matrix(colMeans(beta_matrix), ncol = 1)
+  
+  pred_1 <- X_matrix %*% post_mean
+  
+  scaled_X <- as.matrix(X_matrix)
+  
+  # Scale matrix by posterior means
+  for (p1 in 1:p){
+    
+    scaled_X[, p1] <- X_matrix[, p1] * abs(post_mean[[p1]])
+  }
+  
+  # Run LARS Algorithm and get coefficents
+  lars_result <- lars(scaled_X, pred_1)
+  lars_beta <- coef(lars_result)
+  
+  
+  
+  # Scale coefficients
+  for (p2 in 1:p){
+    
+    lars_beta[, p2] <- lars_beta[, p2] * abs(post_mean[[p2]])
+  }
+  
+  # Get X * beta_lambda
+  X_gamma <- X_matrix %*% t(lars_beta)
+  
+  # Get posterior X* beta
+  X_post <- X_matrix %*% t(beta_matrix)
+  
+  # Get dot product of all commons (predicted y values)
+  dot_X_post <- 1/n * apply(X_post, 2, function (x) x %*% x)
+  
+  p_gamma <- dim(X_gamma)[2]
+  
+  # Will contain all distributions for rho_lambda, psi_lambda
+  rho_lambda_matrix <- matrix(nrow = dim(beta_matrix)[1], ncol = p_gamma)
+  psi_lambda_matrix <- matrix(nrow = dim(beta_matrix)[1], ncol = p_gamma)
+  
+  
+  # Get rho_gamma
+  for (p3 in 1:p_gamma){
+    
+    X_error <- apply((X_post - X_gamma[, p3]), 2, function (x) x %*% x)
+    
+    rho_lambda <- dot_X_post/(dot_X_post + sigma_vector + X_error)
+    
+    psi_lambda <- sqrt(1/n * X_error + sigma_vector) - sqrt(sigma_vector)
+    
+    rho_lambda_matrix[, p3] <- rho_lambda
+    
+    psi_lambda_matrix[, p3] <- psi_lambda
+    
+  }
+  
+  # Get model size (non-zero coefficients)
+  model_size <- apply(lars_beta, 1, function(x) sum(x != 0))
+  
+  
+  list_final <- list(rho_lambda_matrix = rho_lambda_matrix, 
+                     psi_lambda_matrix = psi_lambda_matrix,
+                     model_size = model_size, 
+                     lars_beta = lars_beta)
+  
+  return (list_final)
+  
+}
+
+
+```
+
+```{r}
+
+# Get rho_lambda, psi_lambda, model_identifier, and lars output for each of the Bayesian methods 
+bl_1a_rho_psi <- rho_lambda_ve(ss_data_1x, estimates_bl_1a$Beta_Matrix, estimates_bl_1a$Sigma_2)
+bl_2a_rho_psi <- rho_lambda_ve(ss_data_2x, estimates_bl_2a$Beta_Matrix, estimates_bl_2a$Sigma_2)
+bl_3a_rho_psi <- rho_lambda_ve(ss_data_3x, estimates_bl_3a$Beta_Matrix, estimates_bl_3a$Sigma_2)
+
+hs_1a_rho_psi <- rho_lambda_ve(ss_data_1x, estimates_hs_1a$Beta_Matrix, estimates_hs_1a$Sigma_2)
+hs_2a_rho_psi <- rho_lambda_ve(ss_data_2x, estimates_hs_2a$Beta_Matrix, estimates_hs_2a$Sigma_2)
+hs_3a_rho_psi <- rho_lambda_ve(ss_data_3x, estimates_hs_3a$Beta_Matrix, estimates_hs_3a$Sigma_2)
+
+ssvs_1a_rho_psi <- rho_lambda_ve(ss_data_1x, estimates_ssvs_1a$Beta_Matrix, estimates_ssvs_1a$Sigma_2)
+ssvs_2a_rho_psi <- rho_lambda_ve(ss_data_2x, estimates_ssvs_2a$Beta_Matrix, estimates_ssvs_2a$Sigma_2)
+ssvs_3a_rho_psi <- rho_lambda_ve(ss_data_3x, estimates_ssvs_3a$Beta_Matrix, estimates_ssvs_3a$Sigma_2)
+
+ish_1a_rho_psi <- rho_lambda_ve(ss_data_1x, estimates_ish_1a$Beta_Matrix, estimates_ish_1a$Sigma_2)
+ish_2a_rho_psi <- rho_lambda_ve(ss_data_2x, estimates_ish_2a$Beta_Matrix, estimates_ish_2a$Sigma_2)
+ish_3a_rho_psi <- rho_lambda_ve(ss_data_3x, estimates_ish_3a$Beta_Matrix, estimates_ish_3a$Sigma_2)
+
+```
+
+```{r}
+
+
+make_hc_plot <- function(dist_matrix, model_size, type_plot, 
+                         plot_out = TRUE){
+  
+   # Make two plots suggested by Hahn and Cavarlho
+  cred_rho <- apply(dist_matrix, 2, function(x) quantile(x, c(0.05, 0.95)))
+  
+  if (plot_out == TRUE){
+    
+    # Variation explained plot (rho_lambda)
+  if (type_plot == "VE"){
+    plot(1:length(model_size), colMeans(dist_matrix), pch = 19, col = "red", 
+     ylim = c(0, max(cred_rho)), xlab = "Model Number", ylab = expression(rho[lambda]), 
+     main = "Variation Explained Distribution Plot")
+    
+  }
+  
+  # Excess error plot (psi_lambda)
+  if (type_plot == "EE"){
+    
+      plot(1:length(model_size), colMeans(dist_matrix), pch = 19, col = "red", 
+     ylim = c(0, max(cred_rho)), xlab = "Model Number", ylab = expression(psi[lambda]), 
+     main = "Excess Error Distribution Plot")
+    
+  }
+
+  # Add credible intervals 
+  for (rho_1 in 1:length(model_size)){
+    interval <- cred_rho[, rho_1]
+    segments(rho_1, interval[1], rho_1, interval[2], col = "green")
+  }
+    
+    
+  }
+  
+  
+  return(cred_rho)
+}
+
+
+```
+
+
+```{r}
+
+# Get rho_lambda intervals for each of the betas from lars, for each of the Bayesian models 
+bl_cred_1a_rho <- make_hc_plot(bl_1a_rho_psi$rho_lambda_matrix, 
+                               bl_1a_rho_psi$model_size, "VE")
+bl_cred_2a_rho <- make_hc_plot(bl_2a_rho_psi$rho_lambda_matrix, 
+                               bl_2a_rho_psi$model_size, "VE")
+bl_cred_3a_rho <- make_hc_plot(bl_3a_rho_psi$rho_lambda_matrix, 
+                               bl_3a_rho_psi$model_size, "VE")
+
+hs_cred_1a_rho <- make_hc_plot(hs_1a_rho_psi$rho_lambda_matrix, 
+                               hs_1a_rho_psi$model_size, "VE")
+hs_cred_2a_rho <- make_hc_plot(hs_2a_rho_psi$rho_lambda_matrix, 
+                               hs_2a_rho_psi$model_size, "VE")
+hs_cred_3a_rho <- make_hc_plot(hs_3a_rho_psi$rho_lambda_matrix, 
+                               hs_3a_rho_psi$model_size, "VE")
+
+ssvs_cred_1a_rho <- make_hc_plot(ssvs_1a_rho_psi$rho_lambda_matrix, 
+                               ssvs_1a_rho_psi$model_size, "VE")
+ssvs_cred_2a_rho <- make_hc_plot(ssvs_2a_rho_psi$rho_lambda_matrix, 
+                               ssvs_2a_rho_psi$model_size, "VE")
+ssvs_cred_3a_rho <- make_hc_plot(ssvs_3a_rho_psi$rho_lambda_matrix, 
+                               ssvs_3a_rho_psi$model_size, "VE")
+
+ish_cred_1a_rho <- make_hc_plot(ish_1a_rho_psi$rho_lambda_matrix, 
+                               ish_1a_rho_psi$model_size, "VE")
+ish_cred_2a_rho <- make_hc_plot(ish_2a_rho_psi$rho_lambda_matrix, 
+                               ish_2a_rho_psi$model_size, "VE")
+ish_cred_3a_rho <- make_hc_plot(ish_3a_rho_psi$rho_lambda_matrix, 
+                               ish_3a_rho_psi$model_size, "VE")
+
+
+ish_cred_1a_psi <- make_hc_plot(ish_1a_rho_psi$psi_lambda_matrix, 
+                               ish_1a_rho_psi$model_size, "EE")
+ish_cred_2a_psi <- make_hc_plot(ish_2a_rho_psi$psi_lambda_matrix, 
+                               ish_2a_rho_psi$model_size, "EE")
+ish_cred_3a_psi <- make_hc_plot(ish_3a_rho_psi$psi_lambda_matrix, 
+                               ish_3a_rho_psi$model_size, "EE")
+
+hs_cred_3a_psi <- make_hc_plot(hs_3a_rho_psi$psi_lambda_matrix, 
+                               hs_3a_rho_psi$model_size, "EE")
+
+
+```
+
+
+
+```{r}
+
+hc_model_pick <-function(rho_lambda_matrix, cred_rho_new, lars_beta){
+  
+  # Pick best Hahn and Cavarlho Method 
+  
+  # Get mean rho_lambda of full model
+  expected <- tail(colMeans(rho_lambda_matrix), 1)
+
+  # Find which intervals expected is in
+  log_vec_cred_rho <- apply(cred_rho_new, 2, 
+                            function(x) expected >= x[1] & expected <= x[2])
+  # Pick "best" model
+  min_model <- which(log_vec_cred_rho == TRUE)[1]
+
+  return(matrix(lars_beta[min_model, ], ncol = 1))
+  
+} 
+
+
+# Get the final models for each method dataset pair 
+bayes_lasso_1a_model <- hc_model_pick(bl_1a_rho_psi$rho_lambda_matrix, bl_cred_1a_rho, 
+                                      bl_1a_rho_psi$lars_beta)
+bayes_lasso_2a_model <- hc_model_pick(bl_2a_rho_psi$rho_lambda_matrix, bl_cred_2a_rho, 
+                                      bl_2a_rho_psi$lars_beta)
+bayes_lasso_3a_model <- hc_model_pick(bl_3a_rho_psi$rho_lambda_matrix, bl_cred_3a_rho, 
+                                      bl_3a_rho_psi$lars_beta)
+
+horseshoe_1a_model <- hc_model_pick(hs_1a_rho_psi$rho_lambda_matrix, hs_cred_1a_rho, 
+                                      hs_1a_rho_psi$lars_beta)
+horseshoe_2a_model <- hc_model_pick(hs_2a_rho_psi$rho_lambda_matrix, hs_cred_2a_rho, 
+                                      hs_2a_rho_psi$lars_beta)
+horseshoe_3a_model <- hc_model_pick(hs_3a_rho_psi$rho_lambda_matrix, hs_cred_3a_rho, 
+                                      hs_3a_rho_psi$lars_beta)
+
+ssvs_1a_model <- hc_model_pick(ssvs_1a_rho_psi$rho_lambda_matrix, ssvs_cred_1a_rho, 
+                                      ssvs_1a_rho_psi$lars_beta)
+ssvs_2a_model <- hc_model_pick(ssvs_2a_rho_psi$rho_lambda_matrix, ssvs_cred_2a_rho, 
+                                      ssvs_2a_rho_psi$lars_beta)
+ssvs_3a_model <- hc_model_pick(ssvs_3a_rho_psi$rho_lambda_matrix, ssvs_cred_3a_rho, 
+                                      ssvs_3a_rho_psi$lars_beta)
+
+ish_1a_model <- hc_model_pick(ish_1a_rho_psi$rho_lambda_matrix, ish_cred_1a_rho, 
+                                      ish_1a_rho_psi$lars_beta)
+ish_2a_model <- hc_model_pick(ish_2a_rho_psi$rho_lambda_matrix, ish_cred_2a_rho, 
+                                      ish_2a_rho_psi$lars_beta)
+ish_3a_model <- hc_model_pick(ish_3a_rho_psi$rho_lambda_matrix, ish_cred_3a_rho, 
+                                      ish_3a_rho_psi$lars_beta)
+```
+
+
+```{r}
+find_elastic_lasso <- function(data_x, data_y){
+  
+  # Find best coefficents for LASSO and Elastic Net
+  
+  min_error <- Inf
+  
+  for (alpha in seq(from = 0, to = 1, by = 0.05)){
+    
+    # Run Elastic Net
+    freq_1 <- cv.glmnet(data_x, data_y, intercept = FALSE, alpha = alpha)
+    
+    error_freq_1 <- min(freq_1$cvm)
+    if (error_freq_1 < min_error){
+      
+      # If best model, store it 
+      coef_model <- coef(glmnet(data_x, data_y, lambda = freq_1$lambda.min, 
+                           intercept = FALSE, alpha = alpha))[-1]
+      best_model <- matrix(coef_model, ncol = 1)
+      min_error <- error_freq_1
+      min_alpha <- alpha
+    }
+    
+    
+  }
+  
+  # Run LASSO Regression
+  if (min_alpha == 1){
+    lasso_model <- best_model
+  }
+  else{
+    
+    coef_model <- coef(glmnet(data_x, data_y, lambda = freq_1$lambda.min, 
+                           intercept = FALSE))[-1]
+    lasso_model <- matrix(coef_model, ncol = 1)
+  }
+  
+  # Return best alphia, coefficients for EL, and coefficients for LASSO 
+  return(list(alpha_choice = min_alpha, elastic_coef = best_model, 
+              lasso_coef = lasso_model))
+
+  
+}
+
+freq_regression_1 <- find_elastic_lasso(ss_data_1x, ss_data_1y)
+freq_regression_2 <- find_elastic_lasso(ss_data_2x, ss_data_2y)
+freq_regression_3 <- find_elastic_lasso(ss_data_3x, ss_data_3y)
+```
+
+```{r}
+find_error_all <- function(chosen_model, real_model, test_set_x, test_set_y){
+  
+  real_model_zeros <- which(real_model == 0)
+  chosen_model_zero <- chosen_model[real_model_zeros]
+  
+  # Get False positive rate
+  false_positive <- 1 - sum(chosen_model_zero == 0)/length(chosen_model_zero)
+  
+  # Get coefficient error and test set error 
+  
+  coef_error <- 1/length(chosen_model) * sum(abs(chosen_model - real_model))
+  
+  # Get test error 
+  test_set_predictions <- test_set_x %*% chosen_model
+  
+  test_error <- 1/dim(test_set_y)[1] * sum(abs(test_set_y - test_set_predictions))
+  
+  return(list(false_positive = false_positive, 
+              coef_error = coef_error, 
+              test_set_error = test_error))
+}
+```
+
+
+```{r}
+
+# Get all the errors for each type of model 
+error_bl_1a <- find_error_all(bayes_lasso_1a_model, data_1$Coefficients, 
+                              test_set_1x, test_set_1y)
+error_hs_1a <- find_error_all(horseshoe_1a_model, data_1$Coefficients, 
+                              test_set_1x, test_set_1y)
+
+error_ssvs_1a <- find_error_all(ssvs_1a_model, data_1$Coefficients, 
+                              test_set_1x, test_set_1y)
+
+error_ish_1a <- find_error_all(ish_1a_model, data_1$Coefficients, 
+                              test_set_1x, test_set_1y)
+
+elastic_1a <- find_error_all(freq_regression_1$elastic_coef, data_1$Coefficients, 
+                              test_set_1x, test_set_1y)
+lasso_1a <- find_error_all(freq_regression_1$lasso_coef, data_1$Coefficients, 
+                              test_set_1x, test_set_1y)
+
+error_bl_2a <- find_error_all(bayes_lasso_2a_model, data_2$Coefficients, 
+                              test_set_2x, test_set_2y)
+
+error_hs_2a <- find_error_all(horseshoe_2a_model, data_2$Coefficients, 
+                              test_set_2x, test_set_2y)
+
+error_ssvs_2a <- find_error_all(ssvs_2a_model, data_2$Coefficients, 
+                              test_set_2x, test_set_2y)
+
+error_ish_2a <- find_error_all(ish_2a_model, data_2$Coefficients, 
+                              test_set_2x, test_set_2y)
+
+elastic_2a <- find_error_all(freq_regression_2$elastic_coef, data_2$Coefficients, 
+                              test_set_2x, test_set_2y)
+
+lasso_2a <- find_error_all(freq_regression_2$lasso_coef, data_2$Coefficients, 
+                              test_set_2x, test_set_2y)
+
+error_bl_3a <- find_error_all(bayes_lasso_3a_model, data_3$Coefficients, 
+                              test_set_3x, test_set_3y)
+
+error_hs_3a <- find_error_all(horseshoe_3a_model, data_3$Coefficients, 
+                              test_set_3x, test_set_3y)
+
+error_ssvs_3a <- find_error_all(ssvs_3a_model, data_3$Coefficients, 
+                              test_set_3x, test_set_3y)
+
+error_ish_3a <- find_error_all(ish_3a_model, data_3$Coefficients, 
+                              test_set_3x, test_set_3y)
+
+elastic_3a <- find_error_all(freq_regression_3$elastic_coef, data_3$Coefficients, 
+                              test_set_3x, test_set_3y)
+
+lasso_3a <- find_error_all(freq_regression_3$lasso_coef, data_3$Coefficients, 
+                              test_set_3x, test_set_3y)
+
+
+
+
+
+
+```
+
+```{r}
+
+# Make a dataframe of the errors to easily graph
+error_df_1 <- list()
+
+
+make_error_df <- function(list_items, algo_name, data_table){
+  
+  # Make seperate rows for each type of error 
+  
+  err_df <- data.frame(matrix(nrow = 3, ncol = 4))
+  
+  err_df[1, ] <- list(algo_name, "False Positive Rate", list_items[[1]], data_table)
+  err_df[2, ] <- list(algo_name, "Coefficient Error", list_items[[2]], data_table)
+  err_df[3, ] <- list(algo_name, "Test Set Error", list_items[[3]], data_table)
+  
+  return(err_df)
+}
+
+# Do this for EVERY MODEL 
+
+
+error_df_1[[1]] <- make_error_df(error_bl_1a, "Bayesian LASSO", "Dataset 1")
+error_df_1[[2]] <- make_error_df(error_hs_1a, "Horseshoe", "Dataset 1")
+error_df_1[[3]] <- make_error_df(error_ssvs_1a, "SSVS", "Dataset 1")
+error_df_1[[4]] <- make_error_df(error_ish_1a, "Ishwaran-Rao", "Dataset 1")
+error_df_1[[5]] <- make_error_df(elastic_1a, "Elastic Net", "Dataset 1")
+error_df_1[[6]] <- make_error_df(lasso_1a, "LASSO", "Dataset 1")
+error_df_1[[7]] <- make_error_df(error_bl_2a, "Bayesian LASSO", "Dataset 2")
+error_df_1[[8]] <- make_error_df(error_hs_2a, "Horseshoe", "Dataset 2")
+error_df_1[[9]] <- make_error_df(error_ssvs_2a, "SSVS", "Dataset 2")
+error_df_1[[10]] <- make_error_df(error_ish_2a, "Ishwaran-Rao", "Dataset 2")
+error_df_1[[11]] <- make_error_df(elastic_2a, "Elastic Net", "Dataset 2")
+error_df_1[[12]] <- make_error_df(lasso_2a, "LASSO", "Dataset 2")
+error_df_1[[13]] <- make_error_df(error_bl_3a, "Bayesian LASSO", "Dataset 3")
+error_df_1[[14]] <- make_error_df(error_hs_3a, "Horseshoe", "Dataset 3")
+error_df_1[[15]] <- make_error_df(error_ssvs_3a, "SSVS", "Dataset 3")
+error_df_1[[16]] <- make_error_df(error_ish_3a, "Ishwaran-Rao", "Dataset 3")
+error_df_1[[17]] <- make_error_df(elastic_3a, "Elastic Net", "Dataset 3")
+error_df_1[[18]] <- make_error_df(lasso_3a, "LASSO", "Dataset 3")
+
+# Combine them all
+error_df_1 <- do.call(rbind, error_df_1)
+names(error_df_1) <- c("Model_Name", "Error_Type", "Error", "Dataset")
+
+
+write.csv(error_df_1, "error_df_stat_525.csv")
+```
+
+
+
+```{r}
+# Coefficnt error plot 
+df_coef_error <- dplyr::filter(error_df_1, Error_Type == "Coefficient Error")
+
+ggplot(data=df_coef_error, aes(x=Model_Name, y=Error, fill= Dataset)) +
+  geom_bar(stat="identity", position=position_dodge())+
+  scale_fill_brewer(palette="Paired")+
+  theme_minimal() + labs (x= "Model Name", title = "Coefficient Error Across Models")
+```
+
+```{r}
+
+# False positive plot 
+df_fp<- dplyr::filter(error_df_1, Error_Type == "False Positive Rate")
+
+ggplot(data=df_fp, aes(x=Model_Name, y=Error, fill= Dataset)) +
+  geom_bar(stat="identity", position=position_dodge())+
+  scale_fill_brewer(palette="Paired")+
+  theme_minimal() + labs (x= "Model Name", title = "False Positive Rate Across Models")
+```
+
+```{r}
+
+# Test error plot 
+df_test_error<- dplyr::filter(error_df_1, Error_Type == "Test Set Error")
+
+ggplot(data=df_test_error, aes(x=Model_Name, y=Error, fill= Dataset)) +
+  geom_bar(stat="identity", position=position_dodge())+
+  scale_fill_brewer(palette="Paired")+
+  theme_minimal() + labs (x= "Model Name", title = "Test Set Error Across Models")
+```
+
